@@ -1,0 +1,211 @@
+import cv2
+import numpy as np
+import ezdxf
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.affinity import translate
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import os
+
+def offset_contour(contour, offset_distance, round_corners=False):
+    if len(contour) < 3:
+        return None
+
+    if not np.array_equal(contour[0], contour[-1]):
+        contour = np.vstack([contour, contour[0]])
+
+    poly = Polygon(contour)
+
+    if round_corners:
+        offset_poly = poly.buffer(offset_distance, resolution=2)
+    else:
+        offset_poly = poly.buffer(offset_distance, join_style=2)
+
+    if isinstance(offset_poly, Polygon):
+        return np.array(offset_poly.exterior.coords, dtype=np.int32)
+    elif isinstance(offset_poly, MultiPolygon):
+        combined_coords = []
+        for p in offset_poly.geoms:
+            combined_coords.append(np.array(p.exterior.coords, dtype=np.int32))
+        return combined_coords
+    else:
+        return None
+
+def nest_contours(contours, canvas_width, canvas_height):
+    nested_contours = []
+    current_x, current_y = 0, 0
+    for contour in contours:
+        poly = Polygon(contour)
+        if current_x + poly.bounds[2] < canvas_width:
+            nested_contours.append(translate(poly, current_x, current_y))
+            current_x += poly.bounds[2] + 10
+        else:
+            current_x = 0
+            current_y += poly.bounds[3] + 10
+            nested_contours.append(translate(poly, current_x, current_y))
+    return [np.array(poly.exterior.coords, dtype=np.int32) for poly in nested_contours]
+
+class LamChallengeApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("LAM Challenge")
+        self.root.configure(bg="#FFFFE0")
+        self.create_welcome_screen()
+
+    def create_welcome_screen(self):
+        self.clear_screen()
+        file_path = r"C:\Users\bharg\OneDrive\Desktop\Opencv\1234.png"
+        if not os.path.exists(file_path):
+            messagebox.showerror("Error", f"The file {file_path} does not exist.")
+            return
+
+        self.logo_image = Image.open(file_path)
+        self.logo_photo = ImageTk.PhotoImage(self.logo_image)
+
+        logo_label = tk.Label(self.root, image=self.logo_photo, bg="#FFFFE0")
+        logo_label.image = self.logo_photo
+        logo_label.pack(pady=20)
+
+        title_label = tk.Label(self.root, text="LAM Challenge", font=("Helvetica", 40), bg="#FFFFE0", fg="black")
+        title_label.pack(pady=20)
+
+        start_button = tk.Button(self.root, text="Start", font=("Helvetica", 24), command=self.show_input_page, bg="green", fg="white")
+        start_button.pack(pady=20)
+
+    def show_input_page(self):
+        self.clear_screen()
+
+        frame = tk.Frame(self.root, bg="#FFFFE0")
+        frame.pack(expand=True)
+
+        label1 = tk.Label(frame, text="Enter offset distance for manufacturing tolerances (positive or negative):", font=("Helvetica", 16), bg="#FFFFE0")
+        label1.pack(pady=5)
+        self.offset_entry = tk.Entry(frame, font=("Helvetica", 16))
+        self.offset_entry.pack(pady=5)
+
+        label2 = tk.Label(frame, text="Do you want to round sharp corners? (y/n):", font=("Helvetica", 16), bg="#FFFFE0")
+        label2.pack(pady=5)
+        self.round_entry = tk.Entry(frame, font=("Helvetica", 16))
+        self.round_entry.pack(pady=5)
+
+        submit_button = tk.Button(frame, text="Submit", font=("Helvetica", 16), command=self.start_camera, bg="blue", fg="white")
+        submit_button.pack(pady=20)
+
+    def start_camera(self):
+        try:
+            self.offset_distance = float(self.offset_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number for offset distance.")
+            return
+        
+        round_input = self.round_entry.get().strip().lower()
+        self.round_corners = (round_input == 'y')
+
+        self.clear_screen()
+        label = tk.Label(self.root, text="Camera is on. Press 5 to capture the image and q to close.", font=("Helvetica", 16), bg="#FFFFE0")
+        label.pack(pady=20)
+        self.run_camera()
+
+    def run_camera(self):
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            messagebox.showerror("Error", "Could not open camera")
+            return
+
+        image_counter = 1
+        canvas_width, canvas_height = 1000, 1000
+        last_frame = None
+
+        while True:
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.resize(frame, (640, 480))
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+                edges = cv2.Canny(blurred, 50, 100)
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                optimized_contours = []
+                for contour in contours:
+                    if cv2.contourArea(contour) < 50:
+                        continue
+                    offset_contour_result = offset_contour(contour[:, 0, :], self.offset_distance, self.round_corners)
+                    if offset_contour_result is not None:
+                        if isinstance(offset_contour_result, list):
+                            optimized_contours.extend(offset_contour_result)
+                        else:
+                            optimized_contours.append(offset_contour_result)
+
+                nested_contours = nest_contours(optimized_contours, canvas_width, canvas_height)
+                nested_canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+                for contour in nested_contours:
+                    cv2.drawContours(nested_canvas, [contour], -1, 255, thickness=1)
+
+                cv2.imshow('Camera Feed - Press 5 to Capture or q to Exit', nested_canvas)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord('5'):
+                    last_frame = frame.copy()
+                    dxf_filename = f"contour_image_{image_counter}.dxf"
+                    doc = ezdxf.new(dxfversion='R2010')
+                    msp = doc.modelspace()
+                    for contour in nested_contours:
+                        points = [(point[0], point[1]) for point in contour]
+                        msp.add_lwpolyline(points)
+                    doc.saveas(dxf_filename)
+                    print(f"DXF file saved as {dxf_filename}")
+                    image_counter += 1
+                    self.show_capture_confirmation(last_frame)
+
+                if key == ord('q'):
+                    break
+            else:
+                print("Error: Failed to capture frame")
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    def show_capture_confirmation(self, last_frame):
+        self.clear_screen()
+
+        captured_image = Image.fromarray(cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB))
+        captured_photo = ImageTk.PhotoImage(captured_image)
+
+        frame = tk.Frame(self.root, bg="#FFFFE0")
+        frame.pack(expand=True)
+
+        image_label = tk.Label(frame, image=captured_photo, bg="#FFFFE0")
+        image_label.image = captured_photo
+        image_label.pack(pady=20)
+
+        label = tk.Label(frame, text="Image has been saved and converted into DXF format.", font=("Helvetica", 16), bg="#FFFFE0")
+        label.pack(pady=20)
+
+        capture_again_button = tk.Button(frame, text="Capture Again", command=self.start_camera, font=("Helvetica", 16), bg="blue", fg="white")
+        capture_again_button.pack(side=tk.LEFT, padx=10, pady=20)
+        close_button = tk.Button(frame, text="Close", command=self.show_thank_you_message, font=("Helvetica", 16), bg="red", fg="white")
+        close_button.pack(side=tk.RIGHT, padx=10, pady=20)
+
+    def show_thank_you_message(self):
+        self.clear_screen()
+
+        frame = tk.Frame(self.root, bg="#FFFFE0")
+        frame.pack(expand=True)
+
+        thank_you_label = tk.Label(frame, text="Thank you, regards Chinmaye and team", font=("Helvetica", 24), bg="#FFFFE0", fg="black")
+        thank_you_label.pack(pady=20)
+
+        close_button = tk.Button(frame, text="Close", command=self.root.quit, font=("Helvetica", 16), bg="red", fg="white")
+        close_button.pack(pady=20)
+
+    def clear_screen(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.geometry("800x600")
+    app = LamChallengeApp(root)
+    root.mainloop()
